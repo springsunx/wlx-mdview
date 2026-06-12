@@ -1,5 +1,5 @@
 /*
- * MDView v3.8.1 - Total Commander Lister Plugin for Markdown
+ * MDView v3.9 - Total Commander Lister Plugin for Markdown
  * =========================================================
  * Lightweight WLX plugin: built-in Markdown->HTML, embedded MSHTML, zero deps.
  *
@@ -48,7 +48,7 @@
     #define MDVIEW_RAW_FONT_NAME_A "Cascadia Mono"
     #define MDVIEW_RAW_FONT_NAME L"Cascadia Mono"
 #endif
-#define MDVIEW_RAW_FONT_PT   11
+    #define MDVIEW_RAW_FONT_PT   15
 
 #include <windows.h>
 #include <windowsx.h>
@@ -108,10 +108,12 @@ struct MDViewData {
     size_t        rawCharCount;  /* UTF-8 codepoint count for raw markdown */
     char*         mdUtf8;        /* raw markdown (UTF-8), owned */
     char*         currentFile;   /* current file path (UTF-8), owned */
+    int           pendingSave;   /* 1 = edit save requested via Ctrl+S */
 };
 
 static int load_file_into_existing_view(MDViewData*, const char*);
 static void js_find_apply(MDViewData*, const wchar_t*, int, int);
+static void handle_pending_edit_save(MDViewData*);
 
 #define MDVIEW_SYNC_TIMER_ID 1
 #define MDVIEW_SYNC_TIMER_MS 120
@@ -127,17 +129,25 @@ typedef struct {
     int lineNums;    /* 0 or 1 */
     int rawFontSize; /* raw text font size */
     wchar_t rawFontName[64]; /* raw text font name */
+    int wrapOn;     /* 0 or 1 */
+    int tocOn;      /* 0 or 1 */
+    int editorScale; /* 0 = auto, 100-300 = manual percent */
+    int tocWidth;    /* TOC width in pixels, default 280 */
 } MDVSettings;
 
-static MDVSettings g_settings = { 19, -1, 0, 0, MDVIEW_RAW_FONT_PT, MDVIEW_RAW_FONT_NAME };
+static MDVSettings g_settings = { 19, -1, 0, 0, MDVIEW_RAW_FONT_PT, MDVIEW_RAW_FONT_NAME, 0, 0, 0, 0 };
 
 static void load_settings(void) {
     if (!g_iniPath[0]) return;
     g_settings.fontSize = GetPrivateProfileIntA("MDView", "FontSize", 19, g_iniPath);
     g_settings.isDark = GetPrivateProfileIntA("MDView", "DarkMode", -1, g_iniPath);
-    g_settings.maxWidth = 0;
+    g_settings.maxWidth = GetPrivateProfileIntA("MDView", "MaxWidth", 0, g_iniPath);
     g_settings.lineNums = GetPrivateProfileIntA("MDView", "LineNumbers", 0, g_iniPath);
+    g_settings.wrapOn = GetPrivateProfileIntA("MDView", "WrapOn", 0, g_iniPath);
+    g_settings.tocOn = GetPrivateProfileIntA("MDView", "TocOn", 0, g_iniPath);
     g_settings.rawFontSize = GetPrivateProfileIntA("MDView", "RawFontSize", MDVIEW_RAW_FONT_PT, g_iniPath);
+    g_settings.editorScale = GetPrivateProfileIntA("MDView", "EditorScale", 0, g_iniPath);
+    g_settings.tocWidth = GetPrivateProfileIntA("MDView", "TocWidth", 280, g_iniPath);
     char fontNameA[64];
     GetPrivateProfileStringA("MDView", "RawFontName", MDVIEW_RAW_FONT_NAME_A, fontNameA, sizeof(fontNameA), g_iniPath);
     MultiByteToWideChar(CP_ACP, 0, fontNameA, -1, g_settings.rawFontName, 64);
@@ -159,6 +169,33 @@ static void save_setting_str(const char* key, const wchar_t* val) {
     char buf[64];
     WideCharToMultiByte(CP_ACP, 0, val, -1, buf, sizeof(buf), NULL, NULL);
     WritePrivateProfileStringA("MDView", key, buf, g_iniPath);
+}
+
+static void ensure_ini_int(const char* key, int defval) {
+    if (!g_iniPath[0]) return;
+    char existing[32];
+    GetPrivateProfileStringA("MDView", key, "", existing, sizeof(existing), g_iniPath);
+    if (existing[0] == '\0') save_setting_int(key, defval);
+}
+
+static void ensure_ini_str(const char* key, const char* defval) {
+    if (!g_iniPath[0]) return;
+    char existing[64];
+    GetPrivateProfileStringA("MDView", key, "", existing, sizeof(existing), g_iniPath);
+    if (existing[0] == '\0') WritePrivateProfileStringA("MDView", key, defval, g_iniPath);
+}
+
+static void ensure_ini_defaults(void) {
+    ensure_ini_int("FontSize", 19);
+    ensure_ini_int("DarkMode", -1);
+    ensure_ini_int("MaxWidth", 0);
+    ensure_ini_int("LineNumbers", 0);
+    ensure_ini_int("WrapOn", 0);
+    ensure_ini_int("TocOn", 0);
+    ensure_ini_int("RawFontSize", MDVIEW_RAW_FONT_PT);
+    ensure_ini_str("RawFontName", MDVIEW_RAW_FONT_NAME_A);
+    ensure_ini_int("EditorScale", 0);
+    ensure_ini_int("TocWidth", 280);
 }
 
 static LONG_PTR mdview_set_window_ptr(HWND hwnd, int index, LONG_PTR value) {
@@ -331,7 +368,17 @@ enum {
     IDM_PASTE,
     IDM_TOGGLE_SPLIT,
     IDM_SYNC_PANES,
-    IDM_CLOSE_SEARCH
+    IDM_CLOSE_SEARCH,
+    /* Edit mode command IDs */
+    IDM_EDIT_UNDO = 2001,
+    IDM_EDIT_CUT,
+    IDM_EDIT_COPY,
+    IDM_EDIT_PASTE,
+    IDM_EDIT_DELETE,
+    IDM_EDIT_SELECTALL,
+    IDM_EDIT_SAVE,
+    IDM_EDIT_SYNC,
+    IDM_EDIT_WRAP
 };
 
 static void exec_js(IWebBrowser2* pB, const wchar_t* code) {
@@ -593,6 +640,7 @@ typedef struct {
     int helpVisible;
     int hasMatches;
     int editableActive;
+    int wrapOn;
 } MDViewHtmlState;
 
 static int get_html_state(MDViewData* d, MDViewHtmlState* st) {
@@ -605,13 +653,15 @@ static int get_html_state(MDViewData* d, MDViewHtmlState* st) {
         L"ed=(!!a&&((a.tagName==='INPUT')||(a.tagName==='TEXTAREA')||a.isContentEditable));"
         L"document.title='MDVSTATE:'+fs+','+mw+','+ln+','+(document.body.className.indexOf('dark')>=0?1:0)+','+"
         L"((fb&&fb.className.indexOf('on')>=0)?1:0)+','+((toc&&toc.className.indexOf('on')>=0)?1:0)+','+"
-        L"((h&&h.className.indexOf('on')>=0)?1:0)+','+((typeof fm!=='undefined'&&fm&&fm.length)?1:0)+','+(ed?1:0);})();");
+        L"((h&&h.className.indexOf('on')>=0)?1:0)+','+((typeof fm!=='undefined'&&fm&&fm.length)?1:0)+','+(ed?1:0)+','+"
+        L"(mdvWrap?1:0);})();");
     if (!get_document_title_utf8(d->pBrowser, t, (int)sizeof(t))) return 0;
     if (strncmp(t, "MDVSTATE:", 9) != 0) return 0;
-    return sscanf_s(t + 9, "%d,%d,%d,%d,%d,%d,%d,%d,%d",
+    return sscanf_s(t + 9, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
         &st->fontSize, &st->maxWidth, &st->lineNums, &st->darkMode,
         &st->findVisible, &st->tocVisible, &st->helpVisible,
-        &st->hasMatches, &st->editableActive) == 9;
+        &st->hasMatches, &st->editableActive,
+        &st->wrapOn) == 10;
 }
 
 static void close_html_overlays(MDViewData* d) {
@@ -669,8 +719,24 @@ static void layout_views(MDViewData* d) {
 
 static void toggle_split_view(MDViewData* d);
 
+/* Check if there are unsaved edits */
+static int is_edit_dirty(MDViewData* d) {
+    char title[64];
+    if (!d || !d->pBrowser) return 0;
+    exec_js(d->pBrowser, L"document.title='MDVDIRTY:'+(typeof mdvDirty!=='undefined'&&mdvDirty?1:0)");
+    if (!get_document_title_utf8(d->pBrowser, title, sizeof(title))) return 0;
+    return (strcmp(title, "MDVDIRTY:1") == 0) ? 1 : 0;
+}
+
 static void toggle_split_view(MDViewData* d) {
     if (!d || !d->hwndContainer) return;
+    if (d->splitView && is_edit_dirty(d)) {
+        int ret = MessageBoxW(d->hwndContainer,
+            L"Save changes before closing the editor?",
+            L"Unsaved Changes", MB_YESNOCANCEL | MB_ICONQUESTION | MB_APPLMODAL);
+        if (ret == IDYES) { d->pendingSave = 1; handle_pending_edit_save(d); }
+        else if (ret == IDCANCEL) return;
+    }
     d->splitView = !d->splitView;
 
     layout_views(d);
@@ -682,7 +748,7 @@ static void toggle_split_view(MDViewData* d) {
 }
 
 
-static void show_context_menu(MDViewData* d, HWND hwnd, int x, int y) {
+static void show_view_context_menu(MDViewData* d, HWND hwnd, int x, int y) {
     if (!d) return;
     MDViewHtmlState st;
     int hasState = get_html_state(d, &st);
@@ -792,6 +858,85 @@ static void show_context_menu(MDViewData* d, HWND hwnd, int x, int y) {
     }
 }
 
+/* Edit-mode context menu (shown when right-clicking the contenteditable raw pane) */
+static void show_edit_context_menu(MDViewData* d, HWND hwnd, int x, int y) {
+    if (!d) return;
+    MDViewHtmlState st;
+    int hasState = get_html_state(d, &st);
+
+    HMENU hMenu = CreatePopupMenu();
+    if (!hMenu) return;
+
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_UNDO,      L"Undo\tCtrl+Z");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_CUT,       L"Cut\tCtrl+X");
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_COPY,      L"Copy\tCtrl+C");
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_PASTE,     L"Paste\tCtrl+V");
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_DELETE,    L"Delete");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_SELECTALL, L"Select All\tCtrl+A");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_SAVE,      L"Save && Re-render\tCtrl+S");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_SYNC,      L"Sync panes here\tCtrl+Y");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING | (hasState && st.wrapOn ? MF_CHECKED : 0), IDM_EDIT_WRAP,      L"Toggle word wrap");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_TOGGLE_SPLIT,   L"Exit split view\tCtrl+M");
+
+    UINT flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY;
+    int cmd = (int)TrackPopupMenu(hMenu, flags, x, y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+
+    switch (cmd) {
+    case IDM_EDIT_UNDO:
+        exec_js(d->pBrowser, L"mdvUndo()");
+        break;
+    case IDM_EDIT_CUT:
+        exec_js(d->pBrowser, L"document.execCommand('cut')");
+        break;
+    case IDM_EDIT_COPY:
+        exec_js(d->pBrowser, L"document.execCommand('copy')");
+        break;
+    case IDM_EDIT_PASTE:
+        exec_js(d->pBrowser, L"document.execCommand('paste')");
+        break;
+    case IDM_EDIT_DELETE:
+        exec_js(d->pBrowser, L"var t=mdvRawPane();if(t)t.focus();document.execCommand('delete')");
+        break;
+    case IDM_EDIT_SELECTALL:
+        exec_js(d->pBrowser, L"document.execCommand('selectAll')");
+        break;
+    case IDM_EDIT_SAVE:
+        d->pendingSave = 1;
+        break;
+    case IDM_EDIT_SYNC:
+        exec_js(d->pBrowser, L"mdvSyncFromTextarea()");
+        break;
+    case IDM_EDIT_WRAP:
+        exec_js(d->pBrowser, L"mdvToggleWrap()");
+        break;
+    case IDM_TOGGLE_SPLIT:
+        toggle_split_view(d);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Dispatch to view or edit context menu based on active pane */
+static void show_context_menu(MDViewData* d, HWND hwnd, int x, int y) {
+    if (!d) return;
+    if (d->splitView) {
+        MDViewHtmlState st;
+        if (get_html_state(d, &st) && st.editableActive) {
+            show_edit_context_menu(d, hwnd, x, y);
+            return;
+        }
+    }
+    show_view_context_menu(d, hwnd, x, y);
+}
+
 /* Subclass proc for the IE Server window - only intercepts our Ctrl+ hotkeys,
    everything else (PgUp, PgDn, arrows, Escape, etc.) passes through untouched */
 static LRESULT CALLBACK IEServerSubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
@@ -818,7 +963,11 @@ static LRESULT CALLBACK IEServerSubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPA
             case '0': case VK_NUMPAD0:
                 exec_js(d->pBrowser, L"zr()"); return 0;
             case 'D':
-                exec_js(d->pBrowser, L"td()"); return 0;
+                if (hasState && st.editableActive && d->splitView)
+                    exec_js(d->pBrowser, L"mdvDuplicateLine()");
+                else
+                    exec_js(d->pBrowser, L"td()");
+                return 0;
             case 'T':
                 exec_js(d->pBrowser, L"ttoc()"); return 0;
             case 'F':
@@ -831,8 +980,13 @@ static LRESULT CALLBACK IEServerSubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPA
                 exec_js(d->pBrowser, L"tl()"); return 0;
             case VK_OEM_2:
                 exec_js(d->pBrowser, L"th()"); return 0;
+            case 'S':
+                d->pendingSave = 1;
+                return 0;
             case 'A':
                 do_select_all(d); return 0;
+            case 'X':
+                exec_js(d->pBrowser, L"document.execCommand('cut')"); return 0;
             case 'C':
             case VK_INSERT:
                 do_copy(d); return 0;
@@ -840,8 +994,14 @@ static LRESULT CALLBACK IEServerSubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPA
                 browser_execwb(d->pBrowser, OLECMDID_PASTE); return 0;
             case 'M':
                 toggle_split_view(d); return 0;
+            case 'Z':
+                exec_js(d->pBrowser, L"mdvUndo()"); return 0;
             case 'Y':
-                sync_panes_here(d); return 0;
+                if (hasState && st.editableActive)
+                    exec_js(d->pBrowser, L"mdvRedo()");
+                else
+                    sync_panes_here(d);
+                return 0;
             }
         }
         if (shift && wP == VK_INSERT && hasState && st.editableActive) {
@@ -859,6 +1019,15 @@ static LRESULT CALLBACK IEServerSubclassProc(HWND hwnd, UINT msg, WPARAM wP, LPA
                 exec_js(d->pBrowser, L"hkf(1)");
             else
                 exec_js(d->pBrowser, L"hkf(0)");
+            return 0;
+        }
+        /* Handle Delete key explicitly for textarea */
+        if (wP == VK_DELETE) {
+            exec_js(d->pBrowser, L"(function(){var t=mdvRawPane();if(!t)return;t.focus();"
+                L"var s=t.selectionStart,e=t.selectionEnd,v=t.value;"
+                L"if(s<e){t.value=v.substring(0,s)+v.substring(e);t.selectionStart=t.selectionEnd=s;}"
+                L"else if(s<v.length){t.value=v.substring(0,s)+v.substring(s+1);"
+                L"t.selectionStart=t.selectionEnd=s;}mdvDirty=1;})();");
             return 0;
         }
         
@@ -2148,12 +2317,8 @@ static char* md_to_raw_html(const char* markdown) {
     }
 
     for (int i = 0; i < lines.count; ++i) {
-        char tmp[96];
-        _snprintf(tmp, sizeof(tmp), "<span class=\"mdv-raw-line\" data-raw-line=\"%d\">", i);
-        sb_append(&sb, tmp);
         sb_append_esc(&sb, lines.lines[i], strlen(lines.lines[i]));
-        sb_append(&sb, "</span>");
-        if (i + 1 < lines.count) sb_append(&sb, "<br>");
+        if (i + 1 < lines.count) sb_append(&sb, "\n");
     }
 
     free_lines(&lines);
@@ -2187,27 +2352,55 @@ static void build_css(StrBuf* sb) {
 
     sb_append(sb,
     "#mdv-layout{min-height:100vh}"
-    "#mdv-render-pane{min-width:0}"
+    "#mdv-render-pane{min-width:0;height:calc(100vh - 24px);overflow:auto}"
     "#mdv-raw-pane{display:none}"
     "body.mdv-split{overflow:hidden}"
-    "body.mdv-split #mdv-layout{display:-ms-flexbox;display:flex;height:100vh;min-height:0;width:100%}"
-    "body.mdv-split #mdv-render-pane{-ms-flex:1 1 0;flex:1 1 0;width:50%;height:100vh;overflow:auto;border-right:1px solid #d0d7de}"
+    "body.mdv-split #mdv-layout{display:-ms-flexbox;display:flex;height:100vh;min-height:0;width:100%;position:relative}"
+    "body.mdv-split #mdv-render-pane{-ms-flex:1 1 0;flex:1 1 0;width:50%;height:calc(100vh - 24px);overflow:auto;border-right:1px solid #d0d7de}"
     "body.dark.mdv-split #mdv-render-pane{border-right-color:#444}"
-    "body.mdv-split #mdv-raw-pane{display:block;-ms-flex:1 1 0;flex:1 1 0;width:50%;height:100vh;overflow:auto;margin:0;border:0;border-radius:0;"
-    "background:#fff;color:#24292e;white-space:pre;word-wrap:normal;line-height:1.45;padding:12px 14px 28px}");
+    "body.mdv-split #mdv-ed-wrap{display:-ms-flexbox;display:flex;-ms-flex-direction:column;flex-direction:column;"
+    "-ms-flex:1 1 0;flex:1 1 0;width:50%;height:calc(100vh - 24px);overflow:hidden}"
+    "body.mdv-split #mdv-raw-pane{display:block;-ms-flex:1 1 auto;flex:1 1 auto;width:100%;overflow:auto;margin:0;border:0;border-radius:0;box-sizing:border-box;min-height:0;"
+    "background:#fff;color:#24292e;white-space:pre;word-wrap:normal;line-height:1.45;padding:4px 14px 12px 14px}");
+
+    /* ── Editor wrapper, line gutter, toolbar, status bar ── */
+    sb_append(sb,
+    "#mdv-ed-wrap{display:none}"
+    "#mdv-ed-tbar{display:none;padding:4px 8px;background:#f6f8fa;"
+    "border-bottom:1px solid #d0d7de;font:12px 'Segoe UI',sans-serif;-ms-flex:0 0 auto;flex:0 0 auto;"
+    "box-shadow:0 2px 4px rgba(0,0,0,.08)}"
+    "body.dark #mdv-ed-tbar{background:#2d2d2d;border-bottom-color:#404040}"
+    "body.mdv-split #mdv-ed-tbar{display:-ms-flexbox;display:flex;-ms-flex-wrap:wrap;flex-wrap:wrap;-ms-flex-align:center;align-items:center}"
+    ".tb{padding:4px 8px;border:1px solid transparent;border-radius:3px;background:transparent;"
+    "color:#57606a;cursor:pointer;font-size:13px;line-height:1;min-width:26px;text-align:center;"
+    "font-family:'Segoe UI',sans-serif;margin:2px 1px}"
+    ".tb:hover{background:#e1e4e8;border-color:#d0d7de}"
+    "body.dark .tb{color:#c9d1d9}body.dark .tb:hover{background:#404040;border-color:#555}"
+    "span.tb-div{margin-left:8px;padding-left:8px;border-left:1px solid #d0d7de}"
+    "body.dark span.tb-div{border-left-color:#404040}"
+    "#mdv-ed-status{display:none;position:fixed;bottom:0;right:0;padding:3px 12px;background:#f6f8fa;border-top:1px solid #d0d7de;"
+    "font:11px 'Segoe UI',sans-serif;color:#57606a;z-index:10002;text-align:right}"
+    "body.dark #mdv-ed-status{background:#2d2d2d;border-top-color:#404040;color:#c9d1d9}"
+    "body.mdv-split #mdv-ed-status{display:block;left:50%;right:0}"
+    "body.mdv-split #mdv-raw-pane:focus{outline:none;box-shadow:none}"
+    "body.dark.mdv-split #mdv-raw-pane:focus{box-shadow:none}"
+    "body.mdv-split #mdv-raw-pane::selection{background:#b3d7ff}"
+    "body.dark.mdv-split #mdv-raw-pane::selection{background:#264f78}"
+    "body.mdv-split #mdv-ed-tbar, body.mdv-split #mdv-ed-status"
+    "{transition:background .2s,border-color .2s}");
     { char tmp[192]; char fontA[96];
       WideCharToMultiByte(CP_ACP, 0, g_settings.rawFontName, -1, fontA, sizeof(fontA), NULL, NULL);
-      _snprintf(tmp, sizeof(tmp), "#mdv-raw-pane{font-family:'%s',Consolas,'Courier New',monospace;font-size:%dpt;}", fontA, g_settings.rawFontSize);
+      _snprintf(tmp, sizeof(tmp), "#mdv-raw-pane{font-family:'%s',Consolas,'Courier New',monospace;font-size:%dpx;}", fontA, g_settings.rawFontSize);
       sb_append(sb, tmp);
     }
     sb_append(sb,
     "body.dark #mdv-raw-pane{background:#1e1e1e;color:#d4d4d4}"
-    ".mdv-raw-line{display:inline}"
-    ".mdv-raw-hit{background:#ffe08a;color:#24292e}"
-    "body.dark .mdv-raw-hit{background:#6b5b00;color:#fff7cc}"
-    ".mdv-sync-hit{outline:2px solid #d73a49;background:#fff3f3}"
+    "@keyframes mdvSyncPulse{0%{outline-color:#d73a49;background:#fff3f3}70%{outline-color:#d73a49;background:#fff3f3}100%{outline-color:transparent;background:transparent}}"
+    "body.dark @keyframes mdvSyncPulse{0%{outline-color:#ff7b72;background:#3a2424}70%{outline-color:#ff7b72;background:#3a2424}100%{outline-color:transparent;background:transparent}}"
+    ".mdv-sync-hit{outline:2px solid #d73a49;background:#fff3f3;animation:mdvSyncPulse 1.5s ease-out}"
     "body.dark .mdv-sync-hit{outline-color:#ff7b72;background:#3a2424}"
-    "@media print{#mdv-raw-pane,#mdv-raw-char{display:none!important}"
+
+    "@media print{#mdv-raw-pane,#mdv-raw-char,#mdv-ed-wrap,#mdv-ed-tbar,#mdv-ed-status,#mdv-lstatus{display:none!important}"
     "body.mdv-split{overflow:visible}body.mdv-split #mdv-layout{display:block;height:auto}"
     "body.mdv-split #mdv-render-pane{height:auto;overflow:visible;border-right:0}}");
 
@@ -2353,9 +2546,9 @@ static void build_css(StrBuf* sb) {
     "body.dark .hl{background:#6b5b00}body.dark .hl-a{background:#b37400}"
 
     /* TOC */
-    "#mdv-toc{display:none;position:fixed;top:0;right:0;bottom:0;width:280px;z-index:9999;"
+    "#mdv-toc{display:none;position:fixed;top:0;right:0;bottom:24px;width:280px;z-index:9999;"
     "background:#f6f8fa;border-left:1px solid #e1e4e8;"
-    "overflow-y:auto;padding:16px 0;font-family:inherit;font-size:1em;line-height:1.45;"
+    "overflow:auto;padding:16px 0;font-family:inherit;font-size:1em;line-height:1.45;"
     "box-shadow:-2px 0 12px rgba(0,0,0,.1)}"
     "body.dark #mdv-toc{background:#252526;border-left-color:#404040}"
     "#mdv-toc.on{display:block}"
@@ -2382,19 +2575,13 @@ static void build_css(StrBuf* sb) {
     "background:#0366d6;width:0;transition:width .1s}"
     "body.dark #mdv-prog{background:#569cd6}"
 
-    /* Char count */
-    "#mdv-char,#mdv-raw-char{position:fixed;right:16px;bottom:16px;z-index:10002;"
-    "padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.92);"
-    "border:1px solid #d0d7de;color:#57606a;font:12px 'Segoe UI',sans-serif;"
-    "box-shadow:0 3px 12px rgba(0,0,0,.10);pointer-events:none}"
-    "#mdv-raw-char{bottom:50px;display:none}"
-    "body.mdv-split #mdv-raw-char{display:block}"
-    "body.dark #mdv-char,body.dark #mdv-raw-char{background:rgba(37,37,38,.94);border-color:#444;color:#c9d1d9}"
-    "#mdv-status{position:fixed;left:16px;bottom:16px;z-index:10002;"
-    "padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.92);"
-    "border:1px solid #d0d7de;color:#57606a;font:12px 'Segoe UI',sans-serif;"
-    "box-shadow:0 3px 12px rgba(0,0,0,.10);pointer-events:none}"
-    "body.dark #mdv-status{background:rgba(37,37,38,.94);border-color:#444;color:#c9d1d9}"
+    /* Char count - hidden (moved to status bars) */
+    "#mdv-char,#mdv-raw-char,#mdv-status{display:none}"
+    "#mdv-lstatus{position:fixed;bottom:0;left:0;right:0;z-index:10002;"
+    "padding:3px 12px;background:#f6f8fa;border-top:1px solid #d0d7de;"
+    "font:11px 'Segoe UI',sans-serif;color:#57606a;pointer-events:none}"
+    "body.dark #mdv-lstatus{background:#2d2d2d;border-top-color:#404040;color:#c9d1d9}"
+    "body.mdv-split #mdv-lstatus{width:50%;right:auto}"
 
     /* Help overlay */
     "#mdv-help{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);"
@@ -2434,20 +2621,163 @@ static void build_css(StrBuf* sb) {
 static void build_js(StrBuf* sb) {
     /* Initial values from settings */
     char init[128];
-    _snprintf(init, sizeof(init), "<script>var fs=%d,mw=%d,ln=%d,tt=null;",
-            g_settings.fontSize, g_settings.maxWidth, g_settings.lineNums);
+    _snprintf(init, sizeof(init), "<script>var fs=%d,mw=%d,ln=%d,tt=null,wr=%d,toc=%d,edScale=%d,tocW=%d;",
+            g_settings.fontSize, g_settings.maxWidth, g_settings.lineNums, g_settings.wrapOn, g_settings.tocOn, g_settings.editorScale, g_settings.tocWidth);
     sb_append(sb, init);
 
     sb_append(sb,
     /* Toast */
     "function toast(m){var t=document.getElementById('mdv-toast');t.innerText=m;t.className='on';"
     "if(tt)clearTimeout(tt);tt=setTimeout(function(){t.className=''},1500)}"
-    "var mdvRawActive=0,mdvRawDragging=0,mdvRenderDragging=0,mdvRawSelStart=-1,mdvRawSelEnd=-1,mdvLastX=8,mdvLastY=8,mdvSyncHitTimer=null,mdvPaneRestoreTimer=null;"
+    "var mdvRawActive=0,mdvRawDragging=0,mdvRenderDragging=0,mdvRawSelStart=-1,mdvRawSelEnd=-1,mdvLastX=8,mdvLastY=8,mdvSyncHitTimer=null,mdvPaneRestoreTimer=null,mdvDirty=0;"
+    "var mdvWrap=typeof wr!=='undefined'?wr:0;"
+    "var mdvUndoStack=[],mdvUndoPos=-1,mdvUndoTimer=null;"
+    "function mdvPushUndo(){var ta=mdvRawPane();if(!ta)return;var val=ta.value;"
+    "if(mdvUndoPos>=0&&mdvUndoStack[mdvUndoPos]===val)return;"
+    "mdvUndoStack.length=mdvUndoPos+1;"
+    "mdvUndoStack.push(val);"
+    "if(mdvUndoStack.length>100)mdvUndoStack.shift();"
+    "mdvUndoPos=mdvUndoStack.length-1;}"
+    "function mdvUndo(){"
+    "var ta=mdvRawPane();if(!ta||mdvUndoPos<=0)return;"
+    "mdvUndoPos--;"
+    "ta.value=mdvUndoStack[mdvUndoPos];"
+    "ta.selectionStart=ta.selectionEnd=ta.value.length;"
+    "ta.focus();"
+    "toast('Undo');}"
+
+    "function mdvToggleWrap(){var r=mdvRawPane();if(!r)return;mdvWrap=!mdvWrap;"
+    "if(mdvWrap){r.style.whiteSpace='pre-wrap';r.style.wordWrap='break-word';}"
+    "else{r.style.whiteSpace='pre';r.style.wordWrap='normal';}"
+    "toast(mdvWrap?'Word wrap ON':'Word wrap OFF');}"
+    "function mdvDuplicateLine(){var ta=mdvRawPane();if(!ta||!ta.value)return;"
+    "mdvPushUndo();"
+    "var pos=ta.selectionStart,val=ta.value;"
+    "var start=val.lastIndexOf('\\n',pos-1)+1;"
+    "if(start<0)start=0;"
+    "var end=val.indexOf('\\n',pos);"
+    "if(end<0)end=val.length;"
+    "var line=val.substring(start,end);"
+    "var col=pos-start;"
+    "ta.value=val.substring(0,end+1)+line+'\\n'+val.substring(end+1);"
+    "ta.selectionStart=ta.selectionEnd=end+1+col;"
+    "ta.focus();mdvRawInput();}"
+    "function mdvRawInput(){mdvDirty=1;"
+    "if(mdvUndoTimer)clearTimeout(mdvUndoTimer);"
+    "mdvUndoTimer=setTimeout(function(){mdvUndoTimer=null;mdvPushUndo();},800);"
+    "mdvUpdateStatus();}"
+    "function mdvSaveEdit(){mdvDirty=0;document.title='MDVSAVE:1';}"
     "function mdvRenderPane(){return document.getElementById('mdv-render-pane')}"
     "function mdvRawPane(){return document.getElementById('mdv-raw-pane')}"
+
+    /* ── Status bar (cursor position, char count) ── */
+    "function mdvUpdateStatus(){var ta=mdvRawPane();if(!ta)return;"
+    "var pos=ta.selectionStart,val=ta.value;"
+    "var before=val.substring(0,pos);"
+    "var ln=before.split('\\n').length;"
+    "var col=pos-before.lastIndexOf('\\n');"
+    "var sp=document.querySelector('.mdv-ed-spos');"
+    "var sl=document.querySelector('.mdv-ed-slen');"
+    "if(sp)sp.textContent='Ln '+ln+', Col '+col;"
+    "if(sl)sl.textContent=val.length+' chars';}"
+
+    /* ── Redo ── */
+    "function mdvRedo(){var ta=mdvRawPane();if(!ta)return;"
+    "if(mdvUndoPos>=mdvUndoStack.length-1)return;mdvUndoPos++;"
+    "ta.value=mdvUndoStack[mdvUndoPos];"
+    "ta.selectionStart=ta.selectionEnd=ta.value.length;"
+    "ta.focus();toast('Redo');}"
+
+    /* ── Toolbar command handler ── */
+    "function mdvTbCmd(cmd){var ta=mdvRawPane();if(!ta)return;var s=ta.selectionStart,e=ta.selectionEnd,val=ta.value;"
+    "var sel=val.substring(s,e);var before=val.substring(0,s);var after=val.substring(e);"
+    "var lineStart=before.lastIndexOf('\\n')+1;var line=before.substring(lineStart);"
+    "mdvPushUndo();"
+    "if(cmd==='bold'){ta.value=before+'**'+(sel||'bold text')+'**'+after;"
+    "ta.selectionStart=s+2;ta.selectionEnd=s+2+(sel||'bold text').length;}"
+    "else if(cmd==='italic'){ta.value=before+'*'+(sel||'italic text')+'*'+after;"
+    "ta.selectionStart=s+1;ta.selectionEnd=s+1+(sel||'italic text').length;}"
+    "else if(cmd==='strike'){ta.value=before+'~~'+(sel||'text')+'~~'+after;"
+    "ta.selectionStart=s+2;ta.selectionEnd=s+2+(sel||'text').length;}"
+    "else if(cmd==='link'){var txt=sel||'link text';var url='https://';"
+    "ta.value=before+'['+txt+']('+url+')'+after;"
+    "ta.selectionStart=s+txt.length+3;ta.selectionEnd=s+txt.length+3+url.length;}"
+    "else if(cmd==='image'){var alt=sel||'alt text';var url='https://';"
+    "ta.value=before+'!['+alt+']('+url+')'+after;"
+    "ta.selectionStart=s+alt.length+4;ta.selectionEnd=s+alt.length+4+url.length;}"
+    "else if(cmd==='code'){ta.value=before+'`'+(sel||'code')+'`'+after;"
+    "ta.selectionStart=s+1;ta.selectionEnd=s+1+(sel||'code').length;}"
+    "else if(cmd==='codeblock'){ta.value=before+'\\n```\\n'+(sel||'code')+'\\n```\\n'+after;"
+    "ta.selectionStart=s+5;ta.selectionEnd=s+5+(sel||'code').length;}"
+    "else if(cmd==='ul'){ta.value=before+'- '+sel+after;ta.selectionStart=ta.selectionEnd=s+2+sel.length;}"
+    "else if(cmd==='ol'){ta.value=before+'1. '+sel+after;ta.selectionStart=ta.selectionEnd=s+3+sel.length;}"
+    "else if(cmd==='task'){ta.value=before+'- [ ] '+sel+after;ta.selectionStart=ta.selectionEnd=s+6+sel.length;}"
+    "else if(cmd==='quote'){ta.value=before+'> '+sel+after;ta.selectionStart=ta.selectionEnd=s+2+sel.length;}"
+    "else if(cmd==='hr'){ta.value=before+'\\n---\\n'+after;ta.selectionStart=ta.selectionEnd=s+5;}"
+    "else if(cmd==='h1'){ta.value=before+'# '+sel+after;ta.selectionStart=ta.selectionEnd=s+2+sel.length;}"
+    "else if(cmd==='h2'){ta.value=before+'## '+sel+after;ta.selectionStart=ta.selectionEnd=s+3+sel.length;}"
+    "else if(cmd==='h3'){ta.value=before+'### '+sel+after;ta.selectionStart=ta.selectionEnd=s+4+sel.length;}"
+    "else if(cmd==='undo'){mdvUndo();return;}"
+    "else if(cmd==='redo'){mdvRedo();return;}"
+    "else if(cmd==='save'){mdvSaveEdit();return;}"
+    "ta.focus();mdvRawInput();}"
+
+    /* ── Toolbar click handler ── */
+    "function mdvInitToolbar(){var tbar=document.getElementById('mdv-ed-tbar');if(!tbar)return;"
+    "var sc=edScale>0?edScale:100;"
+    "if(sc!==100){var r=sc/100;tbar.style.fontSize=Math.round(12*r)+'px';"
+    "var bs=tbar.getElementsByTagName('span');for(var i=0;i<bs.length;i++){bs[i].style.fontSize=Math.round(13*r)+'px';bs[i].style.padding=Math.round(4*r)+'px '+Math.round(8*r)+'px';}"
+    "var st=document.getElementById('mdv-ed-status');if(st)st.style.fontSize=Math.round(11*r)+'px';"
+    "var ls=document.getElementById('mdv-lstatus');if(ls)ls.style.fontSize=Math.round(11*r)+'px';}"
+    "tbar.onmousedown=function(ev){ev=ev||window.event;var tgt=ev.target||ev.srcElement;"
+    "while(tgt&&tgt!==tbar){var cmd=tgt.getAttribute&&tgt.getAttribute('data-cmd');"
+    "if(cmd){mdvTbCmd(cmd);if(ev.preventDefault)ev.preventDefault();return false;}"
+    "tgt=tgt.parentNode;}};}"
+
+    /* ── Enhanced editor: Tab indent, Enter auto-indent, Ctrl+B/I/K ── */
+    "function mdvEditorKeyHandler(ev){var ta=mdvRawPane();if(!ta||!mdvIsSplit())return;"
+    "var kc=ev.keyCode||ev.which,ctrl=ev.ctrlKey||ev.metaKey,shift=ev.shiftKey;"
+    "var s=ta.selectionStart,e=ta.selectionEnd,val=ta.value;"
+    "if(kc===9&&!ctrl){ev.preventDefault();mdvPushUndo();"
+    "if(shift){var ls=val.lastIndexOf('\\n',s-1)+1;var le=val.indexOf('\\n',s);if(le<0)le=val.length;"
+    "var ln=val.substring(ls,le);if(ln.indexOf('    ')===0){ta.value=val.substring(0,ls)+ln.substring(4)+val.substring(le);"
+    "ta.selectionStart=Math.max(ls,s-4);ta.selectionEnd=Math.max(ls,e-4);}else if(ln.charAt(0)==='\\t'){"
+    "ta.value=val.substring(0,ls)+ln.substring(1)+val.substring(le);ta.selectionStart=Math.max(ls,s-1);ta.selectionEnd=Math.max(ls,e-1);}}"
+    "else{if(s===e){ta.value=val.substring(0,s)+'    '+val.substring(e);ta.selectionStart=ta.selectionEnd=s+4;}"
+    "else{var sb=val.lastIndexOf('\\n',s-1)+1;var lines=val.substring(s,e).split('\\n');var i;for(i=0;i<lines.length;i++)lines[i]='    '+lines[i];"
+    "ta.value=val.substring(0,s)+lines.join('\\n')+val.substring(e);ta.selectionStart=s;ta.selectionEnd=s+lines.join('\\n').length;}}"
+    "mdvRawInput();return;}"
+    "if(kc===13&&!ctrl){var ls2=val.lastIndexOf('\\n',s-1)+1;var curLine=val.substring(ls2,s);"
+    "var indent='';var j=0;while(j<curLine.length&&(curLine.charAt(j)===' '||curLine.charAt(j)==='\\t')){indent+=curLine.charAt(j);j++;}"
+    "var trimmed=curLine.replace(/^\\s+/,'');var bullet='';"
+    "if(trimmed.indexOf('- [ ] ')===0||trimmed.indexOf('- [x] ')===0)bullet='- [ ] ';"
+    "else if(trimmed.indexOf('- ')===0||trimmed.indexOf('* ')===0||trimmed.indexOf('+ ')===0)bullet=trimmed.charAt(0)+' ';"
+    "else{var olm=/^(\\d+)\\. /.exec(trimmed);if(olm)bullet=(parseInt(olm[1],10)+1)+'. ';}"
+    "ev.preventDefault();mdvPushUndo();"
+    "ta.value=val.substring(0,s)+'\\n'+indent+bullet+val.substring(e);"
+    "ta.selectionStart=ta.selectionEnd=s+1+indent.length+bullet.length;"
+    "mdvRawInput();return;}"
+    "if(ctrl&&!shift&&kc===66){ev.preventDefault();mdvTbCmd('bold');return;}"
+    "if(ctrl&&!shift&&kc===73){ev.preventDefault();mdvTbCmd('italic');return;}"
+    "if(ctrl&&!shift&&kc===75){ev.preventDefault();mdvTbCmd('link');return;}"
+    "if(ctrl&&shift&&kc===38){ev.preventDefault();mdvMoveLine(-1);return;}"
+    "if(ctrl&&shift&&kc===40){ev.preventDefault();mdvMoveLine(1);return;}}"
+
+    /* ── Move line up/down ── */
+    "function mdvMoveLine(dir){var ta=mdvRawPane();if(!ta)return;var val=ta.value,pos=ta.selectionStart;"
+    "var ls=val.lastIndexOf('\\n',pos-1)+1;var le=val.indexOf('\\n',pos);if(le<0)le=val.length;"
+    "var line=val.substring(ls,le);var col=pos-ls;"
+    "if(dir<0){if(ls===0)return;var pls=val.lastIndexOf('\\n',ls-2)+1;mdvPushUndo();"
+    "ta.value=val.substring(0,pls)+line+'\\n'+val.substring(pls,ls)+val.substring(le+1);"
+    "ta.selectionStart=ta.selectionEnd=pls+col;}"
+    "else{if(le>=val.length)return;var nle=val.indexOf('\\n',le+1);if(nle<0)nle=val.length;mdvPushUndo();"
+    "ta.value=val.substring(0,ls)+val.substring(le+1,nle)+'\\n'+line+val.substring(nle);"
+    "ta.selectionStart=ta.selectionEnd=ls+(nle-le-1)+col;}"
+    "mdvRawInput();}"
+
     "function mdvIsSplit(){return document.body&&document.body.className.indexOf('mdv-split')>=0}"
-    "function mdvScrollY(){var p=mdvRenderPane(),de=document.documentElement,b=document.body;if(mdvIsSplit()&&p)return p.scrollTop;return (window.pageYOffset||((de&&de.scrollTop)||0)||((b&&b.scrollTop)||0));}"
-    "function mdvSetScrollY(y){var p=mdvRenderPane();if(y<0)y=0;if(mdvIsSplit()&&p){p.scrollTop=y;return;}window.scrollTo(0,y)}"
+    "function mdvScrollY(){var p=mdvRenderPane();if(p)return p.scrollTop;var de=document.documentElement,b=document.body;return (window.pageYOffset||((de&&de.scrollTop)||0)||((b&&b.scrollTop)||0));}"
+    "function mdvSetScrollY(y){var p=mdvRenderPane();if(y<0)y=0;if(p){p.scrollTop=y;return;}window.scrollTo(0,y)}"
     "function mdvScrollElToTop(el,pad){var st;if(!el)return;pad=(pad||0);st=mdvScrollY();mdvSetScrollY(el.getBoundingClientRect().top+st-pad)}"
     "function mdvAnchorEls(){var ct=document.getElementById('mdv-ct');return ct&&ct.querySelectorAll?ct.querySelectorAll('[data-mdv-line]'):[]}"
     "function mdvLineAtY(y){var els=mdvAnchorEls(),best=null,bestTop=-999999,bestH=2147483647,i,r,top,h,ln;"
@@ -2482,8 +2812,7 @@ static void build_js(StrBuf* sb) {
     "if(best){st=mdvScrollY();top=best.getBoundingClientRect().top+st-y;mdvSetScrollY(top);}}"
     "function mdvNorm(s){return String(s||'').toLowerCase().replace(/[^a-z0-9\\u0080-\\uffff]+/g,' ').replace(/^\\s+|\\s+$/g,'').replace(/\\s+/g,' ')}"
     "function mdvScore(t,s){if(t===s)return 0;if(t.indexOf(s)===0)return 1;if(t.indexOf(s)>=0)return 2;if(s.indexOf(t)>=0)return 3;return 999}"
-    "function mdvRawLineEl(line){var r=mdvRawPane();if(!r)return null;var es=r.getElementsByTagName('span'),i;for(i=0;i<es.length;i++)if(es[i].getAttribute('data-raw-line')==line)return es[i];return null}"
-    "function mdvRawText(line){var e=mdvRawLineEl(line);return e?(e.innerText||e.textContent||''):''}"
+    "function mdvRawText(line){var r=mdvRawPane();if(!r||!r.value)return'';var l=r.value.split('\\n');return(line>=0&&line<l.length)?l[line]:''}"
     "function mdvRawRangeText(a,b){var r=mdvRawPane(),es=r?r.getElementsByTagName('span'):[],out=[],i,ln,tmp;if(!r||!es.length)return '';"
     "a=parseInt(a,10);b=parseInt(b,10);if(isNaN(a)||isNaN(b)||a<0||b<0)return '';if(a>b){tmp=a;a=b;b=tmp;}"
     "for(i=0;i<es.length;i++){ln=parseInt(es[i].getAttribute('data-raw-line'),10);if(!isNaN(ln)&&ln>=a&&ln<=b)out.push(es[i].innerText||es[i].textContent||'');}return out.join('\\r\\n')}"
@@ -2494,7 +2823,7 @@ static void build_js(StrBuf* sb) {
     "function mdvBestRaw(sig,hint){var r=mdvRawPane(),es=r?r.getElementsByTagName('span'):[],best=null,bs=999,bd=2147483647,bl=2147483647,i,e,txt,sc,ln,d,tl;for(i=0;i<es.length;i++){e=es[i];txt=mdvNorm(e.innerText||e.textContent||'');if(txt.length<8)continue;sc=mdvScore(txt,sig);if(sc>=999)continue;ln=parseInt(e.getAttribute('data-raw-line'),10);d=isNaN(ln)?0:Math.abs(ln-hint);tl=txt.length;if(sc<bs||(sc===bs&&(d<bd||(d===bd&&tl<bl)))){best=e;bs=sc;bd=d;bl=tl;}}return best}"
     "function mdvBestDom(sig,hint){var els=mdvAnchorEls(),best=null,bs=999,bd=2147483647,bl=2147483647,i,e,txt,sc,ln,d,tl;for(i=0;i<els.length;i++){e=els[i];if(e.tagName&&/^(UL|OL|TABLE)$/i.test(e.tagName))continue;txt=mdvNorm(e.innerText||e.textContent||'');if(txt.length<8)continue;sc=mdvScore(txt,sig);if(sc>=999)continue;ln=parseInt(e.getAttribute('data-mdv-line'),10);d=isNaN(ln)?0:Math.abs(ln-hint);tl=txt.length;if(sc<bs||(sc===bs&&(d<bd||(d===bd&&tl<bl)))){best=e;bs=sc;bd=d;bl=tl;}}return best}"
     "function mdvBlockForRawLine(line){var els=mdvAnchorEls(),best=null,span=2147483647,i,e,ln,en,sp;for(i=0;i<els.length;i++){e=els[i];if(e.tagName&&/^(UL|OL|TABLE)$/i.test(e.tagName))continue;ln=parseInt(e.getAttribute('data-mdv-line'),10);en=parseInt(e.getAttribute('data-mdv-line-end'),10);if(isNaN(ln))continue;if(isNaN(en)||en<ln)en=ln;if(line>=ln&&line<=en){sp=en-ln;if(sp<span){span=sp;best=e;}}}return best}"
-    "function mdvClearSyncHits(){var r=mdvRawPane(),i,es;if(mdvSyncHitTimer){clearTimeout(mdvSyncHitTimer);mdvSyncHitTimer=null;}if(r){es=r.getElementsByTagName('span');for(i=0;i<es.length;i++)es[i].className=es[i].className.replace(/\\bmdv-raw-hit\\b/g,'').replace(/^\\s+|\\s+$/g,'');}es=mdvAnchorEls();for(i=0;i<es.length;i++)es[i].className=(es[i].className||'').replace(/\\bmdv-sync-hit\\b/g,'').replace(/^\\s+|\\s+$/g,'')}"
+    "function mdvClearSyncHits(){if(mdvSyncHitTimer){clearTimeout(mdvSyncHitTimer);mdvSyncHitTimer=null;}var es=mdvAnchorEls(),i;for(i=0;i<es.length;i++)es[i].className=(es[i].className||'').replace(/\\bmdv-sync-hit\\b/g,'').replace(/^\\s+|\\s+$/g,'')}"
     "function mdvScheduleClearSyncHits(){if(mdvSyncHitTimer)clearTimeout(mdvSyncHitTimer);mdvSyncHitTimer=setTimeout(function(){mdvSyncHitTimer=null;mdvClearSyncHits();},1500)}"
     "function mdvScrollRawElToY(el,y){var r=mdvRawPane(),st;if(!r||!el)return;if(y<0)y=0;st=r.scrollTop;r.scrollTop=Math.max(0,st+el.getBoundingClientRect().top-r.getBoundingClientRect().top-y);el.className=(el.className?el.className+' ':'')+'mdv-raw-hit';mdvScheduleClearSyncHits()}"
     "function mdvScrollDomElToY(el,y){var st;if(!el)return;if(y<0)y=0;st=mdvScrollY();mdvSetScrollY(Math.max(0,st+el.getBoundingClientRect().top-(mdvIsSplit()?mdvRenderPane().getBoundingClientRect().top:0)-y));el.className=(el.className?el.className+' ':'')+'mdv-sync-hit';mdvScheduleClearSyncHits()}"
@@ -2502,9 +2831,20 @@ static void build_js(StrBuf* sb) {
     "function mdvSyncRawPoint(y){var line=mdvLineFromRawPoint(y),sig,el;if(line<0)return;mdvClearSyncHits();el=mdvBlockForRawLine(line);if(!el){sig=mdvRawSig(line);el=mdvBestDom(sig,line);}if(el)mdvScrollDomElToY(el,y)}"
     "function mdvSyncRenderPoint(x,y){var ct=document.getElementById('mdv-ct'),e=document.elementFromPoint(x,y),n=e,a=null,ln=-1,block,txt,sig,raw;if(!ct)return;while(n&&n!==ct){if(n.getAttribute&&n.getAttribute('data-mdv-line')!==null){a=n;ln=parseInt(n.getAttribute('data-mdv-line'),10);break;}n=n.parentNode;}block=e;while(block&&block!==ct){if(block.tagName&&/^(P|LI|TD|TH|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE)$/i.test(block.tagName))break;block=block.parentNode;}if((!block||block===ct)&&a)block=a;if(!block||block===ct)return;txt=(e&&e.tagName&&/^IMG$/i.test(e.tagName))?((e.alt||'')+' '+(e.getAttribute('src')||'')):(block.innerText||block.textContent||'');sig=mdvNorm(txt).substring(0,160);raw=mdvBestRaw(sig,isNaN(ln)?-1:ln);mdvClearSyncHits();if(raw)mdvScrollRawElToY(raw,y)}"
     "function mdvSyncPoint(x,y){var r=mdvRawPane(),rr;if(r&&mdvIsSplit()){rr=r.getBoundingClientRect();if(x>=rr.left&&x<=rr.right&&y>=rr.top&&y<=rr.bottom){mdvRawActive=1;mdvLastX=x;mdvLastY=y;mdvSyncRawPoint(y-rr.top);return;}mdvRawActive=0;}mdvLastX=x;mdvLastY=y;mdvSyncRenderPoint(x,y)}"
-    "function mdvSyncHere(){var r=mdvRawPane(),rr,y=mdvLastY;if(mdvRawActive){rr=r?r.getBoundingClientRect():null;mdvSyncRawPoint(rr?Math.max(0,y-rr.top):8);return;}mdvSyncRenderPoint(mdvLastX||24,mdvLastY||8)}"
-    "function usv(){var s=document.getElementById('mdv-status');if(!s)return;"
-    "s.innerText='Zoom '+Math.round((fs*100)/19)+'%'+(ln?' | Line #':'');}"
+    "function mdvSyncHere(){if(mdvRawActive){mdvSyncFromTextarea();return;}mdvSyncRenderPoint(mdvLastX||24,mdvLastY||8)}"
+    "function mdvTextareaLine(){var ta=mdvRawPane();if(!ta||!ta.value)return 0;"
+    "var pos=ta.selectionStart,before=ta.value.substring(0,pos);"
+    "return before.split('\\n').length-1;}"
+    "function mdvSyncFromTextarea(){var line=mdvTextareaLine();mdvClearSyncHits();"
+    "var el=mdvBlockForRawLine(line);if(!el){var sig=mdvNorm(mdvRawText(line));"
+    "if(sig.length<8){sig=mdvNorm(mdvRawText(line-1)+' '+mdvRawText(line)+' '+mdvRawText(line+1));}"
+    "el=mdvBestDom(sig,line);}if(el){var rp=mdvRenderPane();"
+    "var cy=rp?Math.round(rp.clientHeight/2):Math.round((window.innerHeight||document.documentElement.clientHeight)/2);"
+    "mdvScrollDomElToY(el,Math.max(8,cy));}}"
+    "function usv(){var s=document.getElementById('mdv-lstatus');if(!s)return;"
+    "var z='Zoom '+Math.round((fs*100)/19)+'%';"
+    "var mc=typeof rcc==='function'?('MD: '+rcc()):'';"
+    "s.innerText=z+(ln?' | Line #':'')+(mc?' | '+mc:'');}"
 
     /* Char count */
     "function rcc(){var ct=document.getElementById('mdv-ct'),out=[],walker,n,pv;"
@@ -2520,7 +2860,9 @@ static void build_js(StrBuf* sb) {
     "out.push(t);pv=t.slice(-1);}"
     "return out.join('').replace(/\\r|\\n/g,'').replace(/^\\s+|\\s+$/g,'').length;}"
     "function rawcc(){return mdvRawAllText().replace(/\\r|\\n/g,'').length}"
-    "function ucc(){var el=document.getElementById('mdv-char'),rw=document.getElementById('mdv-raw-char');if(el)el.innerText='MD chars: '+rcc();if(rw)rw.innerText='RAW chars: '+rawcc();}"
+    "function ucc(){var ls=document.getElementById('mdv-lstatus'),es=document.querySelector('.mdv-ed-slen');"
+    "if(ls){var z='Zoom '+Math.round((fs*100)/19)+'%';var mc='MD: '+rcc();ls.innerText=z+' | '+(ln?'Line # | ':'')+mc;}"
+    "if(es)es.innerText='RAW: '+rawcc();}"
 
     /* Zoom */
     "function zi(){fs=Math.min(fs+1,30);af()}"
@@ -2613,8 +2955,19 @@ static void build_js(StrBuf* sb) {
     "a.onclick=(function(id){return function(e){e.preventDefault?e.preventDefault():e.returnValue=false;var el=document.getElementById(id);if(el)mdvScrollElToTop(el,12)}})(h.id);"
     "toc.appendChild(a)}initLinkTooltips()}"
     "function ttoc(){var toc=document.getElementById('mdv-toc');"
-    "if(toc.className.indexOf('on')>=0){toc.className='';document.body.style.marginRight='0'}"
-    "else{btoc();toc.className='on';document.body.style.marginRight='280px'}usv()}"
+    "if(toc.className.indexOf('on')>=0){toc.className='';document.body.style.marginRight='0';"
+    "var rp=mdvRenderPane(),ew=document.getElementById('mdv-ed-wrap');"
+    "if(rp){rp.style.msFlex='';rp.style.flex='';rp.style.width='';}"
+    "if(ew){ew.style.msFlex='';ew.style.flex='';ew.style.width='';ew.style.marginLeft='';}"
+    "toc.style.left='';toc.style.right=''}"
+    "else{btoc();toc.className='on';toc.style.width=tocW+'px';"
+    "if(mdvIsSplit()){document.body.style.marginRight='0';"
+    "var hw=tocW/2,rp=mdvRenderPane(),ew=document.getElementById('mdv-ed-wrap');"
+    "if(rp){rp.style.msFlex='0 0 auto';rp.style.flex='0 0 auto';rp.style.width='calc(50% - '+hw+'px)';}"
+    "if(ew){ew.style.msFlex='0 0 auto';ew.style.flex='0 0 auto';ew.style.width='calc(50% - '+hw+'px)';ew.style.marginLeft=tocW+'px';}"
+    "toc.style.left='calc(50% - '+hw+'px)';toc.style.right='auto'}"
+    "else{document.body.style.marginRight=tocW+'px';"
+    "toc.style.left='';toc.style.right=''}}usv()}"
 
     /* Link tooltip preview */
     "function mdvLinkTitleText(a){var href,raw;if(!a)return '';"
@@ -2743,7 +3096,42 @@ static void build_js(StrBuf* sb) {
     "function th(){var h=document.getElementById('mdv-help');h.className=h.className==='on'?'':'on'}"
     "function mdvStopBubble(e){e=e||window.event;if(e.stopPropagation)e.stopPropagation();e.cancelBubble=true;return true}"
 
-    "function mdvSetSplit(on){var b=document.body,c=b.className||'';on=on?1:0;if(on){if(c.indexOf('mdv-split')<0)b.className=(c?c+' ':'')+'mdv-split';}else{b.className=c.replace(/\\bmdv-split\\b/g,'').replace(/^\\s+|\\s+$/g,'');mdvRawActive=0;mdvRawSelStart=-1;mdvRawSelEnd=-1;}syncMermaidTypography();fitImages();up();}"
+    /* ── Initialize editor UI: toolbar, gutter, event listeners ── */
+    "function mdvInitEditorUI(){var ta=mdvRawPane();if(!ta)return;"
+    "mdvInitToolbar();"
+    "if(!ta._mdvBound){ta._mdvBound=1;"
+    "ta.addEventListener('input',function(){mdvRawInput();});"
+    "ta.addEventListener('scroll',function(){mdvUpdateStatus();});"
+    "ta.addEventListener('click',function(){mdvUpdateStatus();});"
+    "ta.addEventListener('keyup',function(){mdvUpdateStatus();});"
+    "ta.addEventListener('select',function(){mdvUpdateStatus();});"
+    "ta.addEventListener('focus',function(){mdvUpdateStatus();});"
+    "ta.addEventListener('keydown',function(ev){mdvEditorKeyHandler(ev);});"
+    "}"
+    "mdvUpdateStatus();}"
+
+    "function mdvSetSplit(on){on=on?1:0;"
+    "var b=document.body,c=b.className||'';"
+    "if(on){"
+    "  if(c.indexOf('mdv-split')<0)b.className=(c?c+' ':'')+'mdv-split';"
+    "  mdvInitEditorUI();"
+    "  if(typeof ttoc==='function'){var toc=document.getElementById('mdv-toc');"
+    "  if(toc&&toc.className.indexOf('on')>=0){"
+    "  var hw=tocW/2,rp=mdvRenderPane(),ew=document.getElementById('mdv-ed-wrap');"
+    "  if(rp){rp.style.msFlex='0 0 auto';rp.style.flex='0 0 auto';rp.style.width='calc(50% - '+hw+'px)';}"
+    "  if(ew){ew.style.msFlex='0 0 auto';ew.style.flex='0 0 auto';ew.style.width='calc(50% - '+hw+'px)';ew.style.marginLeft=tocW+'px';}"
+    "  toc.style.left='calc(50% - '+hw+'px)';toc.style.right='auto';b.style.marginRight='0'}}"
+    "}else{"
+    "  b.className=c.replace(/\\bmdv-split\\b/g,'').replace(/^\\s+|\\s+$/g,'');"
+    "  mdvRawActive=0;mdvRawSelStart=-1;mdvRawSelEnd=-1;"
+    "  if(typeof ttoc==='function'){var toc=document.getElementById('mdv-toc');"
+    "  if(toc&&toc.className.indexOf('on')>=0){"
+    "  var rp=mdvRenderPane(),ew=document.getElementById('mdv-ed-wrap');"
+    "  if(rp){rp.style.msFlex='';rp.style.flex='';rp.style.width='';}"
+    "  if(ew){ew.style.msFlex='';ew.style.flex='';ew.style.width='';ew.style.marginLeft='';}"
+    "  toc.style.left='';toc.style.right='';b.style.marginRight=tocW+'px'}}"
+    "}"
+    "syncMermaidTypography();fitImages();up();}"
     "function mdvSelectElement(el){var r,s;if(!el)return;if(document.body&&document.body.createTextRange){r=document.body.createTextRange();r.moveToElementText(el);r.select();return;}if(document.createRange&&window.getSelection){r=document.createRange();r.selectNodeContents(el);s=window.getSelection();if(s.removeAllRanges)s.removeAllRanges();s.addRange(r);}}"
     "function mdvSelectActive(){var raw=mdvRawActive&&mdvIsSplit(),r=mdvRawPane(),es=r?r.getElementsByTagName('span'):[];if(raw){mdvRawSelStart=0;mdvRawSelEnd=es.length?es.length-1:0;}mdvSelectElement(raw?r:document.getElementById('mdv-ct'))}"
     "function mdvCopyActive(){var t;if(mdvRawActive&&mdvIsSplit()){t=mdvRawSelectedText();if(t&&window.clipboardData&&window.clipboardData.setData){window.clipboardData.setData('Text',t);return;}}document.execCommand&&document.execCommand('copy')}"
@@ -2764,7 +3152,7 @@ static void build_js(StrBuf* sb) {
     "function mdvRawDragEnd(e){if(!mdvRawDragging){mdvEndPaneDrag();return;}e=e||window.event;mdvRawActive=1;mdvRawSelEnd=mdvRawPointLine(e);mdvLastX=e.clientX;mdvLastY=e.clientY;mdvEndPaneDrag();}"
 
     /* Progress */
-    "function up(){var b=document.getElementById('mdv-prog'),d=mdvIsSplit()?mdvRenderPane():document.body,"
+    "function up(){var b=document.getElementById('mdv-prog'),d=mdvIsSplit()?mdvRenderPane():document.documentElement,"
     "st=mdvScrollY(),sh=d?d.scrollHeight-d.clientHeight:0;"
     "if(sh>0)b.style.width=(st/sh*100)+'%';else b.style.width='0'}"
     "window.onscroll=up;"
@@ -3080,6 +3468,7 @@ static void build_js(StrBuf* sb) {
     "if(c&&k===80){pd(e);window.print();return false}"
     "if(c&&k===71){pd(e);mdvSetScrollY(0);return false}"
     "if(c&&k===76){pd(e);tl();return false}"
+    "if(c&&k===83){pd(e);mdvSaveEdit();return false}"
     "if(c&&k===77){pd(e);mdvSetSplit(!mdvIsSplit());return false}"
     "if(c&&k===89){pd(e);mdvSyncHere();return false}"
     "if(k===112||(c&&k===191)){pd(e);th();return false}"
@@ -3104,10 +3493,28 @@ static void build_js(StrBuf* sb) {
     "for(var fi0=0;fi0<fops.length;fi0++){var fel=document.getElementById(fops[fi0]);if(fel)fel.onclick=function(){qf(0)};}"
     "var hp=document.getElementById('mdv-help');if(hp){hp.onmousewheel=mdvStopBubble;hp.onwheel=mdvStopBubble;}"
     "var hc=document.getElementById('mdv-help-close');if(hc)hc.title='Close help';"
+    "function _mwHandler(e){if(!e)e=window.event;var ctrl=e.ctrlKey||e.metaKey;if(!ctrl)return;"
+    "var delta=e.deltaY||(e.wheelDelta?-e.wheelDelta:0);"
+    "var ta=mdvRawPane();if(ta&&mdvIsSplit()&&e.target&&(e.target===ta||e.target.parentNode===ta||e.target.id==='mdv-ed-tbar'||e.target.id==='mdv-ed-status')){"
+    "var cs=window.getComputedStyle?getComputedStyle(ta):null;"
+    "var fs=parseInt(ta.style.fontSize,10);"
+    "if(!fs||isNaN(fs))fs=cs?parseInt(cs.fontSize,10):0;"
+    "if(!fs||isNaN(fs))fs=15;"
+    "if(delta<0)fs+=1;else if(delta>0)fs=Math.max(8,fs-1);"
+    "ta.style.fontSize=fs+'px';"
+    "document.title='MDVFONTSIZE:'+fs;"
+    "if(e.preventDefault)e.preventDefault();e.returnValue=false;return;}"
+    "if(delta<0)zi();else if(delta>0)zo();"
+    "if(e.preventDefault)e.preventDefault();e.returnValue=false;}"
+    "if(document.addEventListener)document.addEventListener('wheel',_mwHandler,{passive:false});"
+    "else if(document.attachEvent)document.attachEvent('onmousewheel',_mwHandler);"
+    "else document.onmousewheel=_mwHandler;"
     "var rp=mdvRenderPane(),rawp=mdvRawPane();"
     "if(rp){rp.onscroll=up;rp.onmousedown=mdvRenderDragStart;rp.onselectstart=function(){return !mdvRawDragging};rp.oncontextmenu=rp.onmousedown;}"
-    "if(rawp){rawp.onmousedown=mdvRawDragStart;rawp.onmousemove=mdvRawDragMove;rawp.onmouseup=mdvRawDragEnd;rawp.onselectstart=function(){return !mdvRenderDragging};rawp.oncontextmenu=mdvRawDragStart;rawp.onscroll=function(){mdvRawActive=1};}"
+    "if(rawp){rawp.oninput=mdvRawInput;rawp.onscroll=function(){mdvRawActive=1};rawp.onfocus=function(){mdvRawActive=1;mdvPushUndo();};rawp.onblur=function(){mdvRawActive=0};rawp.ondblclick=function(){mdvRawActive=1;mdvSyncFromTextarea();};}"
     "document.onmouseup=function(e){if(mdvRawDragging)mdvRawDragEnd(e||window.event);else if(mdvRenderDragging)mdvEndPaneDrag();return true};"
+    "if(mdvWrap){var rp=mdvRawPane();if(rp){rp.style.whiteSpace='pre-wrap';rp.style.wordWrap='break-word';}}"
+    "if(toc){ttoc();}"
     "afw();fitImages();initMermaid();shAll();initCollapse();initDetailsFallback();initLinkTooltips();"
     "if(ln)tl();"  /* apply line numbers if saved */
     "usv();"
@@ -3140,6 +3547,7 @@ static const char* get_ui(void) {
     "<div id=\"mdv-char\"></div>"
     "<div id=\"mdv-raw-char\"></div>"
     "<div id=\"mdv-status\"></div>"
+    "<div id=\"mdv-lstatus\"></div>"
     "<div id=\"mdv-toc\"><div id=\"mdv-toc-t\">Table of Contents</div></div>"
     "<div id=\"mdv-toast\"></div>"
     "<div id=\"mdv-help\">"
@@ -3174,7 +3582,15 @@ static const char* get_ui(void) {
     "<div class=\"hrow\"><span>This help</span><span class=\"hkeys\"><span class=\"kc\">F1</span></span></div>"
     "<div class=\"help-sep\"></div>"
 
-    "<div class=\"help-foot\">MDView v3.8.1 &middot; Settings auto-saved &middot; Press Esc to close</div>"
+    "<div class=\"hrow\"><span>Bold (editor)</span><span class=\"hkeys\"><span class=\"kc\">Ctrl</span><span class=\"kc-plus\">+</span><span class=\"kc\">B</span></span></div>"
+    "<div class=\"hrow\"><span>Italic (editor)</span><span class=\"hkeys\"><span class=\"kc\">Ctrl</span><span class=\"kc-plus\">+</span><span class=\"kc\">I</span></span></div>"
+    "<div class=\"hrow\"><span>Insert link (editor)</span><span class=\"hkeys\"><span class=\"kc\">Ctrl</span><span class=\"kc-plus\">+</span><span class=\"kc\">K</span></span></div>"
+    "<div class=\"hrow\"><span>Indent / Outdent</span><span class=\"hkeys\"><span class=\"kc\">Tab</span> / <span class=\"kc\">Shift</span><span class=\"kc-plus\">+</span><span class=\"kc\">Tab</span></span></div>"
+    "<div class=\"hrow\"><span>Move line up / down</span><span class=\"hkeys\"><span class=\"kc\">Ctrl</span><span class=\"kc-plus\">+</span><span class=\"kc\">Shift</span><span class=\"kc-plus\">+</span><span class=\"kc\">&#8593;/&#8595;</span></span></div>"
+    "<div class=\"hrow\"><span>Save (editor)</span><span class=\"hkeys\"><span class=\"kc\">Ctrl</span><span class=\"kc-plus\">+</span><span class=\"kc\">S</span></span></div>"
+    "<div class=\"help-sep\"></div>"
+
+    "<div class=\"help-foot\">MDView v3.9 &middot; Settings auto-saved &middot; Press Esc to close</div>"
     "</div>";
 }
 
@@ -3236,7 +3652,39 @@ static void js_find_step(MDViewData* d, int backwards) {
 /* ── File Reading ────────────────────────────────────────────────────── */
 
 static char* read_file_utf8(const char* fn) {
-    FILE* f=fopen(fn,"rb"); if(!f)return NULL;
+    FILE* f = NULL;
+    wchar_t* wfn;
+    int wl;
+
+    if (!fn) return NULL;
+
+    /* Try 1: interpret fn as UTF-8 (used by ListLoadW -> UTF-8 conversion) */
+    wl = MultiByteToWideChar(CP_UTF8, 0, fn, -1, NULL, 0);
+    if (wl > 0) {
+        wfn = (wchar_t*)malloc((size_t)wl * sizeof(wchar_t));
+        if (wfn) {
+            MultiByteToWideChar(CP_UTF8, 0, fn, -1, wfn, wl);
+            f = _wfopen(wfn, L"rb");
+            free(wfn);
+        }
+    }
+
+    /* Try 2: interpret fn as system ANSI (GBK on Chinese Windows, used by ListLoad) */
+    if (!f) {
+        wl = MultiByteToWideChar(CP_ACP, 0, fn, -1, NULL, 0);
+        if (wl > 0) {
+            wfn = (wchar_t*)malloc((size_t)wl * sizeof(wchar_t));
+            if (wfn) {
+                MultiByteToWideChar(CP_ACP, 0, fn, -1, wfn, wl);
+                f = _wfopen(wfn, L"rb");
+                free(wfn);
+            }
+        }
+    }
+
+    /* Try 3: direct fopen as last resort */
+    if (!f) f = fopen(fn, "rb");
+    if (!f) return NULL;
     if (fseek(f,0,SEEK_END) != 0) { fclose(f); return NULL; }
     long sz=ftell(f);
     if (sz < 0 || sz > MDVIEW_MAX_FILE_SIZE) { fclose(f); return NULL; }
@@ -3249,6 +3697,48 @@ static char* read_file_utf8(const char* fn) {
     if(sz>=3&&(unsigned char)buf[0]==0xEF&&(unsigned char)buf[1]==0xBB&&(unsigned char)buf[2]==0xBF)
         memmove(buf,buf+3,sz-2);
     return buf;
+}
+
+/* ── File Writing (for edit save) ────────────────────────────────────── */
+
+static int write_file_utf8(const char* fn, const char* content) {
+    FILE* f = NULL;
+    wchar_t* wfn;
+    int wl;
+    size_t len;
+    int ok = 0;
+
+    if (!fn || !content) return 0;
+
+    wl = MultiByteToWideChar(CP_UTF8, 0, fn, -1, NULL, 0);
+    if (wl > 0) {
+        wfn = (wchar_t*)malloc((size_t)wl * sizeof(wchar_t));
+        if (wfn) {
+            MultiByteToWideChar(CP_UTF8, 0, fn, -1, wfn, wl);
+            f = _wfopen(wfn, L"wb");
+            free(wfn);
+        }
+    }
+    if (!f) {
+        wl = MultiByteToWideChar(CP_ACP, 0, fn, -1, NULL, 0);
+        if (wl > 0) {
+            wfn = (wchar_t*)malloc((size_t)wl * sizeof(wchar_t));
+            if (wfn) {
+                MultiByteToWideChar(CP_ACP, 0, fn, -1, wfn, wl);
+                f = _wfopen(wfn, L"wb");
+                free(wfn);
+            }
+        }
+    }
+    if (!f) f = fopen(fn, "wb");
+    if (!f) return 0;
+
+    len = strlen(content);
+    if (len > 0 && fwrite(content, 1, len, f) == len) ok = 1;
+    else if (len == 0) ok = 1;
+
+    fclose(f);
+    return ok;
 }
 
 /* ── WebBrowser Control ──────────────────────────────────────────────── */
@@ -3314,7 +3804,7 @@ static void save_current_settings(IWebBrowser2* pB) {
     if (!pB || !g_iniPath[0]) return;
     /* Read values from JS globals via execScript + document.title hack */
     /* We set document.title to a serialized string, then read it */
-    exec_js(pB, L"document.title=''+fs+','+mw+','+ln+','+(document.body.className.indexOf('dark')>=0?1:0)");
+    exec_js(pB, L"document.title=''+fs+','+mw+','+ln+','+(document.body.className.indexOf('dark')>=0?1:0)+','+(typeof mdvWrap!=='undefined'&&mdvWrap?1:0)+','+((document.getElementById('mdv-toc').className.indexOf('on')>=0)?1:0)");
     /* Now read the title back */
     IDispatch* pDisp = NULL;
     IWebBrowser2_get_Document(pB, &pDisp);
@@ -3330,15 +3820,104 @@ static void save_current_settings(IWebBrowser2* pB) {
         char title[128];
         WideCharToMultiByte(CP_UTF8, 0, bTitle, -1, title, sizeof(title), NULL, NULL);
         SysFreeString(bTitle);
-        int rfs=19, rmw=0, rln=0, rdk=0;
-        sscanf_s(title, "%d,%d,%d,%d", &rfs, &rmw, &rln, &rdk);
+        int rfs=19, rmw=0, rln=0, rdk=0, rwr=0, rtoc=0;
+        sscanf_s(title, "%d,%d,%d,%d,%d,%d", &rfs, &rmw, &rln, &rdk, &rwr, &rtoc);
         save_setting_int("FontSize", rfs);
         save_setting_int("MaxWidth", rmw);
         save_setting_int("LineNumbers", rln);
         save_setting_int("DarkMode", rdk);
+        g_settings.wrapOn = rwr ? 1 : 0;
+        save_setting_int("WrapOn", g_settings.wrapOn);
+        g_settings.tocOn = rtoc ? 1 : 0;
+        save_setting_int("TocOn", g_settings.tocOn);
         save_setting_int("RawFontSize", g_settings.rawFontSize);
         save_setting_str("RawFontName", g_settings.rawFontName);
     }
+}
+
+/* ── Edit-in-place support ──────────────────────────────────────────── */
+
+/* Set the innerHTML of a DOM element by ID using COM */
+static int set_element_inner_html(IWebBrowser2* pBrowser, const wchar_t* id, const char* utf8Html) {
+    IDispatch* pDisp = NULL;
+    IHTMLDocument3* pDoc3 = NULL;
+    IHTMLElement* pEl = NULL;
+    BSTR bId = NULL;
+    BSTR bHtml = NULL;
+    wchar_t* wh = NULL;
+    int wl;
+    int result = 0;
+
+    if (!pBrowser || !id || !utf8Html) return 0;
+    if (FAILED(IWebBrowser2_get_Document(pBrowser, &pDisp)) || !pDisp) return 0;
+    if (FAILED(IDispatch_QueryInterface(pDisp, &IID_IHTMLDocument3, (void**)&pDoc3))) {
+        IDispatch_Release(pDisp); return 0;
+    }
+    IDispatch_Release(pDisp);
+    if (!pDoc3) return 0;
+
+    bId = SysAllocString(id);
+    if (!bId) { IHTMLDocument3_Release(pDoc3); return 0; }
+    if (FAILED(IHTMLDocument3_getElementById(pDoc3, bId, &pEl))) {
+        SysFreeString(bId); IHTMLDocument3_Release(pDoc3); return 0;
+    }
+    SysFreeString(bId);
+    IHTMLDocument3_Release(pDoc3);
+    if (!pEl) return 0;
+
+    wl = MultiByteToWideChar(CP_UTF8, 0, utf8Html, -1, NULL, 0);
+    if (wl <= 0) { IHTMLElement_Release(pEl); return 0; }
+    wh = (wchar_t*)malloc((size_t)wl * sizeof(wchar_t));
+    if (!wh) { IHTMLElement_Release(pEl); return 0; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8Html, -1, wh, wl);
+    bHtml = SysAllocString(wh);
+    free(wh);
+    if (!bHtml) { IHTMLElement_Release(pEl); return 0; }
+
+    if (SUCCEEDED(IHTMLElement_put_innerHTML(pEl, bHtml))) result = 1;
+    SysFreeString(bHtml);
+    IHTMLElement_Release(pEl);
+    return result;
+}
+
+/* Handle edit save: re-parse edited markdown from raw pane and update rendered view */
+static void handle_pending_edit_save(MDViewData* d) {
+    wchar_t* rawWide = NULL;
+    char* rawUtf8 = NULL;
+    char* newBody = NULL;
+
+    if (!d || !d->pBrowser || !d->pendingSave) return;
+    d->pendingSave = 0;
+
+    /* Read raw markdown text directly from the contenteditable raw pane */
+    rawWide = get_element_text_by_id(d, L"mdv-raw-pane");
+    if (!rawWide) return;
+
+    rawUtf8 = wide_to_utf8_dup(rawWide);
+    free(rawWide);
+    if (!rawUtf8) return;
+
+    /* Write edited content back to the original file */
+    if (d->currentFile) {
+        write_file_utf8(d->currentFile, rawUtf8);
+    }
+
+    /* Re-parse markdown to HTML */
+    newBody = md_to_html(rawUtf8, d->currentFile);
+    if (!newBody) {
+        free(rawUtf8);
+        return;
+    }
+
+    /* Update only the rendered content pane via COM */
+    set_element_inner_html(d->pBrowser, L"mdv-ct", newBody);
+
+    /* Re-run JS init routines on the new content and reset dirty flag */
+    exec_js(d->pBrowser,
+        L"mdvDirty=0;fitImages();initMermaid();shAll();initCollapse();initLinkTooltips();ucc();up();");
+
+    free(newBody);
+    free(rawUtf8);
 }
 
 static int load_file_into_existing_view(MDViewData* d, const char* fileUtf8) {
@@ -3384,7 +3963,7 @@ static int load_file_into_existing_view(MDViewData* d, const char* fileUtf8) {
     build_js(&jsBuf);
     ui = get_ui();
 
-    fl = strlen(body) + strlen(rawHtml) + cssBuf.len + jsBuf.len + strlen(ui) + 1536;
+    fl = strlen(body) + strlen(rawHtml) + cssBuf.len + jsBuf.len + strlen(ui) + 4096;
     full = (char*)malloc(fl);
     if (!full) {
         free(md);
@@ -3399,7 +3978,31 @@ static int load_file_into_existing_view(MDViewData* d, const char* fileUtf8) {
         "<!DOCTYPE html><html%s><head>"
         "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">"
         "<meta charset=\"utf-8\"><style>%s</style></head><body%s>"
-        "%s<div id=\"mdv-layout\"><div id=\"mdv-render-pane\"><div id=\"mdv-ct\">%s</div></div><pre id=\"mdv-raw-pane\">%s</pre></div>%s</body></html>",
+        "%s<div id=\"mdv-layout\"><div id=\"mdv-render-pane\"><div id=\"mdv-ct\">%s</div></div>"
+        "<div id=\"mdv-ed-wrap\"><div id=\"mdv-ed-tbar\">"
+        "<span class=\"tb\" data-cmd=\"h1\" title=\"Heading 1\">H1</span>"
+        "<span class=\"tb\" data-cmd=\"h2\" title=\"Heading 2\">H2</span>"
+        "<span class=\"tb\" data-cmd=\"h3\" title=\"Heading 3\">H3</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"bold\" title=\"Bold (Ctrl+B)\"><b>B</b></span>"
+        "<span class=\"tb\" data-cmd=\"italic\" title=\"Italic (Ctrl+I)\"><i>I</i></span>"
+        "<span class=\"tb\" data-cmd=\"strike\" title=\"Strikethrough\"><s>S</s></span>"
+        "<span class=\"tb tb-div\" data-cmd=\"link\" title=\"Link (Ctrl+K)\">&#128279;</span>"
+        "<span class=\"tb\" data-cmd=\"image\" title=\"Image\">&#128248;</span>"
+        "<span class=\"tb\" data-cmd=\"code\" title=\"Inline Code\">&lt;/&gt;</span>"
+        "<span class=\"tb\" data-cmd=\"codeblock\" title=\"Code Block\">&#9776;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"ul\" title=\"Unordered List\">&#8226;</span>"
+        "<span class=\"tb\" data-cmd=\"ol\" title=\"Ordered List\">1.</span>"
+        "<span class=\"tb\" data-cmd=\"task\" title=\"Task List\">&#9744;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"quote\" title=\"Blockquote\">&#10077;</span>"
+        "<span class=\"tb\" data-cmd=\"hr\" title=\"Horizontal Rule\">&#9135;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"undo\" title=\"Undo (Ctrl+Z)\">&#8630;</span>"
+        "<span class=\"tb\" data-cmd=\"redo\" title=\"Redo (Ctrl+Y)\">&#8631;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"save\" title=\"Save (Ctrl+S)\">&#128190;</span>"
+        "</div>"
+        "<textarea id=\"mdv-raw-pane\" spellcheck=\"false\">%s</textarea>"
+        "<div id=\"mdv-ed-status\"><span class=\"mdv-ed-spos\">Ln 1, Col 1</span> | <span class=\"mdv-ed-slen\">0 chars</span></div>"
+        "</div>"
+    "</div>%s</body></html>",
         dark ? " style=\"background:#1e1e1e\"" : "", cssBuf.data, dark ? " class=\"dark\"" : "", ui, body, rawHtml, jsBuf.data);
 
     navigate_to_html(d->pBrowser, full);
@@ -3437,6 +4040,24 @@ static LRESULT CALLBACK ContainerWndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM 
     case WM_TIMER:
         if (d && wP == MDVIEW_SYNC_TIMER_ID && d->pBrowser) {
             handle_pending_link_command(d);
+            /* Check for toolbar save signal via document.title */
+            if (!d->pendingSave) {
+                char t[64];
+                if (get_document_title_utf8(d->pBrowser, t, sizeof(t))) {
+                    if (strcmp(t, "MDVSAVE:1") == 0) {
+                        d->pendingSave = 1;
+                        exec_js(d->pBrowser, L"document.title='MDView';");
+                    } else if (strncmp(t, "MDVFONTSIZE:", 12) == 0) {
+                        int sz = atoi(t + 12);
+                        if (sz >= 6 && sz <= 72) {
+                            g_settings.rawFontSize = sz;
+                            save_setting_int("RawFontSize", sz);
+                        }
+                        exec_js(d->pBrowser, L"document.title='MDView';");
+                    }
+                }
+            }
+            handle_pending_edit_save(d);
             return 0;
         }
         break;
@@ -3488,6 +4109,7 @@ static void ensure_ie11_emulation(void) {
 __declspec(dllexport) HWND __stdcall ListLoad(HWND pw, char* file, int flags) {
     ensure_ie11_emulation();
     load_settings();
+    ensure_ini_defaults();
 
     if(!g_classRegistered){
         WNDCLASSEXW wc={0}; wc.cbSize=sizeof(wc); wc.lpfnWndProc=ContainerWndProc;
@@ -3517,7 +4139,7 @@ __declspec(dllexport) HWND __stdcall ListLoad(HWND pw, char* file, int flags) {
     StrBuf jsBuf;  sb_init(&jsBuf);  build_js(&jsBuf);
     const char* ui = get_ui();
 
-    size_t fl=strlen(body)+strlen(rawHtml)+cssBuf.len+jsBuf.len+strlen(ui)+1536;
+    size_t fl=strlen(body)+strlen(rawHtml)+cssBuf.len+jsBuf.len+strlen(ui)+4096;
     char* full=(char*)malloc(fl);
     if (!full) {
         free(body);
@@ -3531,7 +4153,31 @@ __declspec(dllexport) HWND __stdcall ListLoad(HWND pw, char* file, int flags) {
         "<!DOCTYPE html><html%s><head>"
         "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">"
         "<meta charset=\"utf-8\"><style>%s</style></head><body%s>"
-        "%s<div id=\"mdv-layout\"><div id=\"mdv-render-pane\"><div id=\"mdv-ct\">%s</div></div><pre id=\"mdv-raw-pane\">%s</pre></div>%s</body></html>",
+        "%s<div id=\"mdv-layout\"><div id=\"mdv-render-pane\"><div id=\"mdv-ct\">%s</div></div>"
+        "<div id=\"mdv-ed-wrap\"><div id=\"mdv-ed-tbar\">"
+        "<span class=\"tb\" data-cmd=\"h1\" title=\"Heading 1\">H1</span>"
+        "<span class=\"tb\" data-cmd=\"h2\" title=\"Heading 2\">H2</span>"
+        "<span class=\"tb\" data-cmd=\"h3\" title=\"Heading 3\">H3</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"bold\" title=\"Bold (Ctrl+B)\"><b>B</b></span>"
+        "<span class=\"tb\" data-cmd=\"italic\" title=\"Italic (Ctrl+I)\"><i>I</i></span>"
+        "<span class=\"tb\" data-cmd=\"strike\" title=\"Strikethrough\"><s>S</s></span>"
+        "<span class=\"tb tb-div\" data-cmd=\"link\" title=\"Link (Ctrl+K)\">&#128279;</span>"
+        "<span class=\"tb\" data-cmd=\"image\" title=\"Image\">&#128248;</span>"
+        "<span class=\"tb\" data-cmd=\"code\" title=\"Inline Code\">&lt;/&gt;</span>"
+        "<span class=\"tb\" data-cmd=\"codeblock\" title=\"Code Block\">&#9776;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"ul\" title=\"Unordered List\">&#8226;</span>"
+        "<span class=\"tb\" data-cmd=\"ol\" title=\"Ordered List\">1.</span>"
+        "<span class=\"tb\" data-cmd=\"task\" title=\"Task List\">&#9744;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"quote\" title=\"Blockquote\">&#10077;</span>"
+        "<span class=\"tb\" data-cmd=\"hr\" title=\"Horizontal Rule\">&#9135;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"undo\" title=\"Undo (Ctrl+Z)\">&#8630;</span>"
+        "<span class=\"tb\" data-cmd=\"redo\" title=\"Redo (Ctrl+Y)\">&#8631;</span>"
+        "<span class=\"tb tb-div\" data-cmd=\"save\" title=\"Save (Ctrl+S)\">&#128190;</span>"
+        "</div>"
+        "<textarea id=\"mdv-raw-pane\" spellcheck=\"false\">%s</textarea>"
+        "<div id=\"mdv-ed-status\"><span class=\"mdv-ed-spos\">Ln 1, Col 1</span> | <span class=\"mdv-ed-slen\">0 chars</span></div>"
+        "</div>"
+    "</div>%s</body></html>",
         dark?" style=\"background:#1e1e1e\"":"", cssBuf.data, dark?" class=\"dark\"":"", ui, body, rawHtml, jsBuf.data);
     free(body); free(rawHtml); free(cssBuf.data); free(jsBuf.data);
 
@@ -3607,13 +4253,31 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND pw, WCHAR* file, int flags) 
     return r;
 }
 
-__declspec(dllexport) void __stdcall ListCloseWindow(HWND w) { DestroyWindow(w); }
+__declspec(dllexport) void __stdcall ListCloseWindow(HWND w) {
+    MDViewData* d = (MDViewData*)mdview_get_window_ptr(w, GWLP_USERDATA);
+    if (d && is_edit_dirty(d)) {
+        int ret = MessageBoxW(w, L"Save changes before closing?", L"Unsaved Changes",
+                MB_YESNOCANCEL | MB_ICONQUESTION | MB_APPLMODAL);
+        if (ret == IDYES) {
+            d->pendingSave = 1; handle_pending_edit_save(d);
+        } else if (ret == IDCANCEL) {
+            return;
+        }
+    }
+    DestroyWindow(w);
+}
 
 __declspec(dllexport) int __stdcall ListLoadNext(HWND pw, HWND lw, char* file, int flags) {
     MDViewData* d = (MDViewData*)mdview_get_window_ptr(lw, GWLP_USERDATA);
     (void)pw;
     (void)flags;
     if (!d || !file) return LISTPLUGIN_ERROR;
+    if (is_edit_dirty(d)) {
+        int ret = MessageBoxW(lw, L"Save changes before opening another file?",
+            L"Unsaved Changes", MB_YESNOCANCEL | MB_ICONQUESTION | MB_APPLMODAL);
+        if (ret == IDCANCEL) return LISTPLUGIN_ERROR;
+        if (ret == IDYES) { d->pendingSave = 1; handle_pending_edit_save(d); }
+    }
     return load_file_into_existing_view(d, file);
 }
 

@@ -1,3 +1,24 @@
+v3.9
+- add: editor toolbar with formatting buttons (H1-H3, bold, italic, strikethrough, link, image, code, code block, lists, blockquote, horizontal rule, undo, redo, save)
+- add: editor status bar showing cursor position (line/column) and character count
+- add: left status bar showing zoom level, line numbers toggle, and MD character count
+- add: editor keyboard shortcuts (Ctrl+B bold, Ctrl+I italic, Ctrl+K link, Tab/Shift+Tab indent, Ctrl+Shift+Up/Down move line)
+- add: Ctrl+mouse wheel zoom in editor adjusts font size independently from main display zoom
+- add: INI EditorScale setting for toolbar/status bar scaling on high-DPI displays (0=off, 100-300=percent)
+- add: INI TocWidth setting for custom Table of Contents panel width (default 280)
+- add: INI default parameter check on startup, missing keys are auto-written
+- add: unsaved changes dialog now includes Cancel option when closing window
+- add: TOC in split view repositions between main display and editor panels
+- change: floating status badges (zoom, MD chars, RAW chars) replaced with proper status bars
+- change: Ctrl+mouse wheel zoom intercepted in JavaScript, unified with menu zoom behavior
+- change: split view scrollbar positioned above status bar
+- change: anchor link navigation works in non-split mode with overflow:auto
+- fix: buffer overflow (snprintf overhead increased from 1536 to 4096)
+- fix: Ctrl+Y in edit mode now triggers redo instead of sync panes
+- fix: editor font size uses getComputedStyle for accurate pixel value
+- fix: editor font size unit changed from pt to px for consistent save/restore
+- fix: RawFontSize saved to INI when adjusted via Ctrl+mouse wheel
+
 v3.8.1
 - fix: compact changelog-style lines such as -add: and -change: retain visible line breaks without changing standard Markdown list parsing
 - docs: README and package metadata updated for the 3.8.1 release

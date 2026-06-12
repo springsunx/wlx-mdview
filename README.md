@@ -1,4 +1,4 @@
-# MDView 3.8.1
+# MDView 3.9
 
 **A Markdown viewer plugin for Total Commander.**
 
@@ -57,6 +57,15 @@ The repository includes a dedicated `ReleaseXP|Win32` Visual Studio configuratio
 - **Character count with spaces** - both rendered and raw views show a character count aligned to a Word-like convention that excludes line breaks
 - **Split-view positioning** - rendered HTML and raw Markdown panes keep independent scroll positions so manual reading does not jump unexpectedly
 - **Manual split-view alignment** - use `Ctrl+Y`, double click, or the `Sync panes here` context-menu command for source-line alignment from the focused pane
+- **Markdown editor toolbar** - formatting toolbar in split view with buttons for headings (H1-H3), bold, italic, strikethrough, links, images, inline code, code blocks, lists (ordered/unordered/task), blockquotes, horizontal rules, undo, redo, and save
+- **Editor status bar** - displays current cursor position (line and column) and total character count
+- **Editor keyboard shortcuts**
+  - `Ctrl+B` bold, `Ctrl+I` italic, `Ctrl+K` insert link
+  - `Tab` / `Shift+Tab` indent / outdent (supports multi-line selection)
+  - `Enter` auto-indent with smart list continuation (`-`, `*`, `1.`, `- [ ]`)
+  - `Ctrl+Shift+↑/↓` move current line up or down
+  - `Ctrl+S` save file from editor
+  - `Ctrl+Y` redo (in editor mode)
 - **Smart clipboard behaviour**
   - Copy from rendered view -> formatted HTML + plain text
   - Copy from raw view -> original Markdown text
@@ -104,6 +113,14 @@ For the dedicated Windows XP build, Mermaid blocks fall back to the original sou
 | `Ctrl` `G`         | Go to top                         |
 | `Ctrl` `M`         | Toggle split view                 |
 | `Ctrl` `Y`         | Sync split panes here             |
+| `Ctrl` `B`         | Bold (editor)                     |
+| `Ctrl` `I`         | Italic (editor)                   |
+| `Ctrl` `K`         | Insert link (editor)              |
+| `Tab`              | Indent (editor)                   |
+| `Shift` `Tab`      | Outdent (editor)                  |
+| `Ctrl` `Shift` `↑` | Move line up (editor)            |
+| `Ctrl` `Shift` `↓` | Move line down (editor)          |
+| `Ctrl` `S`         | Save (editor)                     |
 | `Ctrl` `A`         | Select all in active view         |
 | `Ctrl` `C`         | Copy selection                    |
 | `F3`               | Find next                         |
@@ -116,7 +133,7 @@ Press `F1` inside the viewer for an on-screen reference.
 
 ## Version
 
-Current release: **MDView 3.8.1**
+Current release: **MDView 3.9**
 
 ## Download
 
@@ -148,6 +165,23 @@ For relative-link and front-matter regression checks, use `Sample_md_files\readm
 For collapsible-section regression checks, use `Sample_md_files\markdown_en.md`.
 
 For embedded-image regression reference, use `Sample_md_files\file_with_embedded_image.md` to verify the current unsupported case documented below.
+
+## INI Configuration
+
+MDView reads and writes settings to an INI file (same directory as the plugin DLL). On first launch, missing keys are written automatically with default values.
+
+| Key              | Default | Description |
+| ---------------- | ------- | ----------- |
+| `FontSize`       | 19      | Rendered view font size (9–30) |
+| `DarkMode`       | -1      | Dark mode: 0 = off, 1 = on, -1 = auto-detect from Windows theme |
+| `MaxWidth`       | 0       | Max content width in pixels (0 = fit to window) |
+| `LineNumbers`    | 0       | Show line numbers in rendered code blocks |
+| `WrapOn`         | 0       | Word wrap in raw/edit view |
+| `TocOn`          | 0       | Auto-show Table of Contents on launch |
+| `RawFontSize`    | 15      | Raw/edit view font size in pixels (6–72) |
+| `RawFontName`    | Cascadia Mono | Raw/edit view font family |
+| `EditorScale`    | 0       | Editor toolbar/status bar scale: 0 = off, 100–300 = percent |
+| `TocWidth`       | 280     | Table of Contents panel width in pixels |
 
 ## Building from Source
 

@@ -1,0 +1,23 @@
+# Build outputs
+Win32/
+x64/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.recipe
+*.FileListAbsolute.txt
+
+# CodeWhale
+.codewhale/
+
+# User-specific
+*.vcxproj.user
+
+# OS
+Thumbs.db
+Desktop.ini
