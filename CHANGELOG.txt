@@ -9,6 +9,7 @@ v3.9
 - add: INI default parameter check on startup, missing keys are auto-written
 - add: unsaved changes dialog now includes Cancel option when closing window
 - add: TOC in split view repositions between main display and editor panels
+- add: copy button on code blocks with hover reveal and "Copied!" feedback
 - change: floating status badges (zoom, MD chars, RAW chars) replaced with proper status bars
 - change: Ctrl+mouse wheel zoom intercepted in JavaScript, unified with menu zoom behavior
 - change: split view scrollbar positioned above status bar

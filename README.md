@@ -71,6 +71,7 @@ The repository includes a dedicated `ReleaseXP|Win32` Visual Studio configuratio
   - Copy from raw view -> original Markdown text
 - **TC copy as text support** - Total Commander "Copy as text" exports only the rendered markdown text, without the viewer status overlays
 - **Expand / collapse** - long code blocks and blockquotes are collapsed by default with a "Show more" button
+- **Code block copy button** - hover over any code block to reveal a "Copy" button in the top-right corner; click to copy the code to clipboard with visual "Copied!" feedback
 - **Raw HTML collapsible sections** - block-level `<details>` / `<summary>` sections are preserved, with a viewer fallback for older MSHTML engines that do not implement native HTML5 details controls
 - **Persistent settings** - font size, theme, line numbers, and raw view settings are saved and restored between sessions
 - **Print support** - `Ctrl+P` renders a clean printable version
